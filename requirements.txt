@@ -1,0 +1,10 @@
+asyncio
+aiohttp
+aiogram
+python-dotenv
+aiosqlite
+<<<<<<< HEAD
+aiofiles
+=======
+aiofiles
+>>>>>>> 53ca98fe8f5c931a905566f5af3093b1614a0b19
