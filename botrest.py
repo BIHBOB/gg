@@ -1,566 +1,407 @@
-import asyncio
 import os
-from datetime import datetime
-import aiohttp
-from aiohttp import web
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, FSInputFile, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
+import telebot
+import vk_api
+import time
+import threading
+import requests
+from telebot import types, apihelper
 from dotenv import load_dotenv
+import signal
+import sys
 import logging
-import aiofiles
-import aiosqlite
-import shutil
+import uuid
 
-# Логирование
-logging.basicConfig(level=logging.INFO)
+# Настройка логирования
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Загружаем переменные из .env
+# Загрузка переменных окружения
 load_dotenv()
 
-# Инициализация бота
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise ValueError("Токен бота не найден.")
-ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
-if not ADMIN_ID:
-    raise ValueError("ID администратора не найден.")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://your-bot-name.onrender.com")
-WEBHOOK_PATH = "/webhook"
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+# Токены
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
+if not TELEGRAM_TOKEN or any(char.isspace() for char in TELEGRAM_TOKEN):
+    logger.error("TELEGRAM_TOKEN не задан или содержит пробелы")
+    raise ValueError("TELEGRAM_TOKEN отсутствует или некорректен")
 
-# Путь для временного хранения файлов и базы данных
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DOCUMENTS_DIR = os.path.join(BASE_DIR, "Documents")
-DATABASE_FILE = os.path.join(BASE_DIR, "database.db")
+VK_TOKEN = os.getenv('VK_TOKEN', '')
 
-if not os.path.exists(DOCUMENTS_DIR):
-    os.makedirs(DOCUMENTS_DIR)
+# Уникальный идентификатор экземпляра
+INSTANCE_ID = str(uuid.uuid4())
+logger.info(f"Запущен экземпляр бота с ID: {INSTANCE_ID}")
 
-# Инициализация базы данных SQLite
-async def init_db():
-    async with aiosqlite.connect(DATABASE_FILE) as conn:
-        await conn.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                full_name TEXT NOT NULL,
-                phone TEXT NOT NULL,
-                role TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending'
-            )
-        ''')
-        await conn.execute('''
-            CREATE TABLE IF NOT EXISTS documents (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                file_path TEXT NOT NULL,
-                upload_date TEXT NOT NULL,
-                role_type TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                FOREIGN KEY (user_id) REFERENCES users(user_id)
-            )
-        ''')
-        await conn.commit()
-    logger.info(f"База данных SQLite инициализирована в {DATABASE_FILE}")
+# Инициализация бота Telegram
+bot = telebot.TeleBot(TELEGRAM_TOKEN, threaded=False)
 
-async def save_user(user_id, full_name, phone, role):
-    async with aiosqlite.connect(DATABASE_FILE) as conn:
-        await conn.execute('''
-            INSERT OR REPLACE INTO users (user_id, full_name, phone, role, status)
-            VALUES (?, ?, ?, ?, 'pending')
-        ''', (user_id, full_name, phone, role))
-        await conn.commit()
+# Инициализация VK API
+vk_session = vk_api.VkApi(token=VK_TOKEN) if VK_TOKEN else None
+vk = vk_session.get_api() if vk_session else None
 
-async def get_user(user_id):
-    async with aiosqlite.connect(DATABASE_FILE) as conn:
-        cursor = await conn.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
-        user = await cursor.fetchone()
-        return user
+# Глобальные переменные
+VK_Groups = [-211223344, -155667788, -199887766, -188445566, -177334455]
+VK_CONVERSATIONS = [2000000001, 2000000005]
+DELAY_TIME = 15
+DELETE_TIME = 15
+SPAM_RUNNING = {'groups': False, 'conversations': False}
+SPAM_THREADS = {'groups': [], 'conversations': []}
+SPAM_TEMPLATE = "Первое сообщение"
+bot_started = False
 
-async def update_user_status(user_id, status):
-    async with aiosqlite.connect(DATABASE_FILE) as conn:
-        await conn.execute('UPDATE users SET status = ? WHERE user_id = ?', (status, user_id))
-        await conn.commit()
+# Основная клавиатура
+def main_menu():
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add(
+        "🚀 Спам в группы", "🚀 Спам в беседы",
+        "⏳ Установить задержку", "🕒 Время удаления",
+        "ℹ️ Статус", "➕ Добавить чат",
+        "✍️ Шаблон для спама", "🔑 Сменить токен VK",
+        "🗑 Удалить чат", "🗑 Очистить API VK"
+    )
+    return markup
 
-async def save_document(user_id, file_path, role_type):
-    current_date = datetime.now().strftime("%Y-%m-%d")
-    async with aiosqlite.connect(DATABASE_FILE) as conn:
-        await conn.execute('''
-            INSERT INTO documents (user_id, file_path, upload_date, role_type, status)
-            VALUES (?, ?, ?, ?, 'pending')
-        ''', (user_id, file_path, current_date, role_type))
-        await conn.commit()
+# Клавиатура спама
+def spam_menu(spam_type):
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add("⛔ Отключить спам")
+    markup.add(
+        "🚀 Спам в группы", "🚀 Спам в беседы",
+        "⏳ Установить задержку", "🕒 Время удаления",
+        "ℹ️ Статус", "➕ Добавить чат",
+        "✍️ Шаблон для спама", "🔑 Сменить токен VK",
+        "🗑 Удалить чат", "🗑 Очистить API VK"
+    )
+    return markup
 
-async def get_pending_users():
-    async with aiosqlite.connect(DATABASE_FILE) as conn:
-        cursor = await conn.execute('SELECT user_id, full_name, role FROM users WHERE status = ?', ('pending',))
-        users = await cursor.fetchall()
-        return users
+# Клавиатура удаления чатов
+def create_remove_chat_keyboard():
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    if VK_Groups or VK_CONVERSATIONS:
+        for group_id in VK_Groups:
+            markup.add(types.InlineKeyboardButton(f"Группа {group_id}", callback_data=f"remove_group_{group_id}"))
+        for conv_id in VK_CONVERSATIONS:
+            markup.add(types.InlineKeyboardButton(f"Беседа {conv_id}", callback_data=f"remove_conversation_{conv_id}"))
+        markup.add(types.InlineKeyboardButton("Отмена", callback_data="cancel_remove"))
+    else:
+        markup.add(types.InlineKeyboardButton("Нет чатов для удаления", callback_data="no_chats"))
+    return markup
 
-async def get_document_by_id(doc_id):
-    async with aiosqlite.connect(DATABASE_FILE) as conn:
-        cursor = await conn.execute('SELECT * FROM documents WHERE id = ?', (doc_id,))
-        doc = await cursor.fetchone()
-        return doc
-
-async def update_document_status(doc_id, status):
-    async with aiosqlite.connect(DATABASE_FILE) as conn:
-        await conn.execute('UPDATE documents SET status = ? WHERE id = ?', (status, doc_id))
-        await conn.commit()
-
-# Обработчики маршрутов
-async def handle_webhook(request):
-    data = await request.json()
-    await dp.feed_raw_update(bot, data)
-    return web.Response(text="OK")
-
-async def handle_root(request):
-    return web.Response(text="Бот жив")
-
-# Самопингование
-async def keep_alive():
-    await asyncio.sleep(10)
-    ping_url = WEBHOOK_URL  # Используем WEBHOOK_URL без лишнего слеша
-    while True:
+# Функция спама
+def send_and_delete_vk_messages(chat_id, telegram_chat_id):
+    global DELAY_TIME, DELETE_TIME, SPAM_TEMPLATE
+    while SPAM_RUNNING['groups'] if chat_id < 0 else SPAM_RUNNING['conversations']:
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(ping_url) as response:
-                    if response.status == 200:
-                        logger.info("Сервис активен")
-                    else:
-                        logger.warning(f"Ошибка пинга: статус {response.status}")
+            if not vk:
+                raise Exception("VK API не инициализирован")
+            msg1 = vk.messages.send(peer_id=chat_id, message=SPAM_TEMPLATE, random_id=int(time.time() * 1000))
+            bot.send_message(telegram_chat_id, f"Отправлено '{SPAM_TEMPLATE}' в VK чат {chat_id}")
+            time.sleep(DELETE_TIME)
+            vk.messages.delete(message_ids=[msg1], delete_for_all=1)
+            bot.send_message(telegram_chat_id, f"Удалено сообщение в VK чат {chat_id}")
+            time.sleep(max(0, DELAY_TIME - DELETE_TIME))
         except Exception as e:
-            logger.error(f"Ошибка самопингования: {e}")
-        await asyncio.sleep(600)
+            logger.error(f"Ошибка в чате {chat_id}: {str(e)}")
+            bot.send_message(telegram_chat_id, f"Ошибка в чате {chat_id}: {str(e)}")
+            break
 
-# Клавиатуры
-def get_role_keyboard():
-    roles = ["Официант", "Администратор", "Бармен", "Менеджер", "Бухгалтер", "СММ", "Повар"]
-    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=role)] for role in roles], resize_keyboard=True, one_time_keyboard=True)
-
-def get_contact_keyboard():
-    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Поделиться контактом", request_contact=True)]], resize_keyboard=True, one_time_keyboard=True)
-
-def get_role_action_keyboard(role):
-    role = role.lower()
-    if role == "администратор":
-        return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Админ-панель")], [KeyboardButton(text="Экспорт базы данных")]], resize_keyboard=True)
-    elif role in ["официант", "бармен", "повар"]:
-        return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Отправить чек")]], resize_keyboard=True)
-    elif role in ["бухгалтер", "смм"]:
-        return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Отправить документ")]], resize_keyboard=True)
-    return None
-
-def get_admin_panel(pending_users=None):
-    keyboard = []
-    if pending_users:
-        for user in pending_users:
-            user_id, full_name, role = user
-            keyboard.append([
-                InlineKeyboardButton(text=f"{full_name} ({role})", callback_data=f"user_info_{user_id}"),
-                InlineKeyboardButton(text="Подтвердить", callback_data=f"approve_{user_id}"),
-                InlineKeyboardButton(text="Отклонить", callback_data=f"reject_{user_id}")
-            ])
-    keyboard.extend([
-        [InlineKeyboardButton(text="Все пользователи", callback_data="all_users")],
-        [InlineKeyboardButton(text="Документы по дате", callback_data="documents_by_date")],
-        [InlineKeyboardButton(text="По сотрудникам", callback_data="documents_by_user")],
-        [InlineKeyboardButton(text="Запросить документы", callback_data="request_documents")],
-        [InlineKeyboardButton(text="Экспорт базы данных", callback_data="export_db")],
-        [InlineKeyboardButton(text="Закрыть меню", callback_data="close_menu")]
-    ])
-    return InlineKeyboardMarkup(inline_keyboard=keyboard)
-
-# Состояния FSM
-class UserRegistration(StatesGroup):
-    full_name = State()
-    phone = State()
-    role = State()
-
-# Вспомогательные функции
-async def check_user(user_id: int) -> tuple[bool, str]:
-    user = await get_user(user_id)
-    if user and user[4] == "approved":  # Индекс 4 — status
-        return True, user[3]  # Индекс 3 — role
-    return False, ""
-
-async def get_all_approved_users():
-    async with aiosqlite.connect(DATABASE_FILE) as conn:
-        cursor = await conn.execute('SELECT user_id, role FROM users WHERE status = ?', ('approved',))
-        users = await cursor.fetchall()
-        return users
+# Улучшенная антиспячка
+def keep_alive():
+    global bot_started
+    # URL вашего приложения на Render или внешний сервис для пинга
+    PING_URL = os.getenv('PING_URL', 'https://your-app-name.onrender.com')  # Замените на ваш URL
+    PING_INTERVAL = 600  # 10 минут (600 секунд)
+    
+    while bot_started:
+        try:
+            # Если у вашего бота есть веб-интерфейс, пингуем его; иначе — внешний сервис
+            response = requests.get(PING_URL, timeout=10)
+            if response.status_code == 200:
+                logger.info(f"Антиспячка: Успешный пинг {PING_URL}, статус {response.status_code}")
+            else:
+                logger.warning(f"Антиспячка: Пинг {PING_URL} вернул статус {response.status_code}")
+        except requests.RequestException as e:
+            logger.error(f"Антиспячка: Ошибка пинга {PING_URL}: {str(e)}")
+            # Если основной URL недоступен, пробуем запасной
+            fallback_url = "https://api.telegram.org"  # Пинг Telegram API как запасной вариант
+            try:
+                requests.get(fallback_url, timeout=5)
+                logger.info(f"Антиспячка: Успешный пинг запасного URL {fallback_url}")
+            except Exception as fallback_e:
+                logger.error(f"Антиспячка: Ошибка пинга запасного URL: {str(fallback_e)}")
+        time.sleep(PING_INTERVAL)
 
 # Обработчики
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message, state: FSMContext):
-    await message.answer("Привет! Введите ваше ФИО для регистрации:")
-    await state.set_state(UserRegistration.full_name)
+@bot.message_handler(commands=['start'])
+def send_welcome(message):
+    logger.info(f"Пользователь {message.chat.id} запустил бота")
+    bot.send_message(message.chat.id, f"Привет! Я бот для спама в VK. Экземпляр: {INSTANCE_ID}", reply_markup=main_menu())
 
-@dp.message(UserRegistration.full_name)
-async def process_full_name(message: types.Message, state: FSMContext):
-    if not message.text or message.text.strip() == "":
-        await message.answer("ФИО не может быть пустым. Введите ваше ФИО:")
+@bot.message_handler(func=lambda message: message.text == "🚀 Спам в группы")
+def start_spam_groups(message):
+    global SPAM_RUNNING, SPAM_THREADS
+    if not VK_Groups:
+        bot.send_message(message.chat.id, "Список групп пуст!", reply_markup=main_menu())
         return
-    await state.update_data(full_name=message.text.strip())
-    await message.answer("Поделитесь контактом:", reply_markup=get_contact_keyboard())
-    await state.set_state(UserRegistration.phone)
-
-@dp.message(UserRegistration.phone, F.contact)
-async def process_contact(message: types.Message, state: FSMContext):
-    phone = message.contact.phone_number
-    await state.update_data(phone=phone)
-    await message.answer("Выберите роль:", reply_markup=get_role_keyboard())
-    await state.set_state(UserRegistration.role)
-
-@dp.message(UserRegistration.role, F.text.in_(["Официант", "Администратор", "Бармен", "Менеджер", "Бухгалтер", "СММ", "Повар"]))
-async def process_role(message: types.Message, state: FSMContext):
-    user_data = await state.get_data()
-    user_id = message.from_user.id
-    role = message.text.strip().lower()
-
-    if "full_name" not in user_data or "phone" not in user_data:
-        await message.answer("Ошибка: не все данные заполнены. Начните заново с /start.")
-        await state.clear()
+    if not vk:
+        bot.send_message(message.chat.id, "VK токен не установлен!", reply_markup=main_menu())
         return
+    SPAM_RUNNING['groups'] = True
+    SPAM_THREADS['groups'] = []
+    for chat_id in VK_Groups[:]:
+        thread = threading.Thread(target=send_and_delete_vk_messages, args=(chat_id, message.chat.id))
+        thread.start()
+        SPAM_THREADS['groups'].append(thread)
+    bot.send_message(message.chat.id, "Спам запущен в группах VK!", reply_markup=spam_menu('groups'))
 
-    full_name = user_data["full_name"]
-    phone = user_data["phone"]
-
-    user = await get_user(user_id)
-    if user:
-        await message.answer("Вы уже зарегистрированы. Обратитесь к администратору.")
-        await state.clear()
+@bot.message_handler(func=lambda message: message.text == "🚀 Спам в беседы")
+def start_spam_conversations(message):
+    global SPAM_RUNNING, SPAM_THREADS
+    if not VK_CONVERSATIONS:
+        bot.send_message(message.chat.id, "Список бесед пуст!", reply_markup=main_menu())
         return
+    if not vk:
+        bot.send_message(message.chat.id, "VK токен не установлен!", reply_markup=main_menu())
+        return
+    SPAM_RUNNING['conversations'] = True
+    SPAM_THREADS['conversations'] = []
+    for chat_id in VK_CONVERSATIONS[:]:
+        thread = threading.Thread(target=send_and_delete_vk_messages, args=(chat_id, message.chat.id))
+        thread.start()
+        SPAM_THREADS['conversations'].append(thread)
+    bot.send_message(message.chat.id, "Спам запущен в беседах VK!", reply_markup=spam_menu('conversations'))
 
-    await save_user(user_id, full_name, phone, role.capitalize())
-    await message.answer(f"Роль: {role.capitalize()}. Ожидайте подтверждения.", reply_markup=ReplyKeyboardRemove())
+@bot.message_handler(func=lambda message: message.text == "⛔ Отключить спам")
+def stop_spam(message):
+    global SPAM_RUNNING
+    SPAM_RUNNING['groups'] = False
+    SPAM_RUNNING['conversations'] = False
+    bot.send_message(message.chat.id, "Спам остановлен!", reply_markup=main_menu())
+
+@bot.message_handler(func=lambda message: message.text == "⏳ Установить задержку")
+def set_delay_prompt(message):
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("15 сек", callback_data="delay_15"),
+        types.InlineKeyboardButton("30 сек", callback_data="delay_30"),
+        types.InlineKeyboardButton("1 мин", callback_data="delay_60"),
+        types.InlineKeyboardButton("5 мин", callback_data="delay_300")
+    )
+    bot.send_message(message.chat.id, "Выбери время между действиями:", reply_markup=markup)
+
+@bot.message_handler(func=lambda message: message.text == "🕒 Время удаления")
+def set_delete_time_prompt(message):
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("15 сек", callback_data="delete_15"),
+        types.InlineKeyboardButton("30 сек", callback_data="delete_30"),
+        types.InlineKeyboardButton("1 мин", callback_data="delete_60"),
+        types.InlineKeyboardButton("5 мин", callback_data="delete_300")
+    )
+    bot.send_message(message.chat.id, "Выбери время до удаления:", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("delay_"))
+def set_delay_callback(call):
+    global DELAY_TIME
+    DELAY_TIME = int(call.data.split("_")[1])
+    bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id,
+                         text=f"Задержка между действиями: {DELAY_TIME} секунд", reply_markup=None)
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.message.chat.id, "Выбери действие:", reply_markup=main_menu())
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("delete_"))
+def set_delete_time_callback(call):
+    global DELETE_TIME
+    DELETE_TIME = int(call.data.split("_")[1])
+    bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id,
+                         text=f"Время до удаления: {DELETE_TIME} секунд", reply_markup=None)
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.message.chat.id, "Выбери действие:", reply_markup=main_menu())
+
+@bot.message_handler(func=lambda message: message.text == "ℹ️ Статус")
+def status(message):
+    groups_str = ", ".join(map(str, VK_Groups)) if VK_Groups else "Пусто"
+    convs_str = ", ".join(map(str, VK_CONVERSATIONS)) if VK_CONVERSATIONS else "Пусто"
+    status_msg = f"Задержка: {DELAY_TIME} сек\nВремя удаления: {DELETE_TIME} сек\nШаблон: '{SPAM_TEMPLATE}'\nГруппы: {groups_str}\nБеседы: {convs_str}\nЭкземпляр: {INSTANCE_ID}"
+    bot.send_message(message.chat.id, status_msg, reply_markup=main_menu())
+
+@bot.message_handler(func=lambda message: message.text == "➕ Добавить чат")
+def add_chat_prompt(message):
+    bot.send_message(message.chat.id, "Введи ID чата VK (- для группы, 2000000000+ для беседы):")
+    bot.register_next_step_handler(message, add_chat)
+
+def add_chat(message):
     try:
-        await bot.send_message(ADMIN_ID, f"Новая заявка:\nФИО: {full_name}\nТелефон: {phone}\nРоль: {role.capitalize()}\nID: {user_id}\n/approve {user_id} или /reject {user_id}")
-    except Exception as e:
-        logger.error(f"Ошибка уведомления: {e}")
-    await state.clear()
-
-@dp.callback_query(F.data.startswith("approve_"))
-async def approve_user(callback_query: types.CallbackQuery):
-    user_id = int(callback_query.data.split("_")[1])
-    await update_user_status(user_id, "approved")
-    user = await get_user(user_id)
-    if user:
-        role = user[3].lower()
-        await bot.send_message(user_id, "Регистрация подтверждена!", reply_markup=get_role_action_keyboard(role))
-        await bot.send_message(callback_query.from_user.id, f"{user[1]} ({user[3]}) подтвержден.")
-    await bot.answer_callback_query(callback_query.id)
-    pending_users = await get_pending_users()
-    await bot.edit_message_reply_markup(chat_id=callback_query.from_user.id, message_id=callback_query.message.message_id, reply_markup=get_admin_panel(pending_users))
-
-@dp.callback_query(F.data.startswith("reject_"))
-async def reject_user(callback_query: types.CallbackQuery):
-    user_id = int(callback_query.data.split("_")[1])
-    await update_user_status(user_id, "rejected")
-    user = await get_user(user_id)
-    if user:
-        await bot.send_message(user_id, "Регистрация отклонена.")
-        await bot.send_message(callback_query.from_user.id, f"{user[1]} отклонен.")
-    await bot.answer_callback_query(callback_query.id)
-    pending_users = await get_pending_users()
-    await bot.edit_message_reply_markup(chat_id=callback_query.from_user.id, message_id=callback_query.message.message_id, reply_markup=get_admin_panel(pending_users))
-
-@dp.message(Command("my_actions"))
-async def show_role_actions(message: types.Message):
-    user_id = message.from_user.id
-    is_registered, role = await check_user(user_id)
-    if not is_registered:
-        await message.answer("Вы не зарегистрированы или не подтверждены.")
-        return
-    keyboard = get_role_action_keyboard(role)
-    if keyboard:
-        await message.answer("Выберите действие:", reply_markup=keyboard)
-    else:
-        await message.answer("Нет действий для вашей роли.")
-
-@dp.message(F.text == "Админ-панель", F.from_user.id == ADMIN_ID)
-async def cmd_admin_panel(message: types.Message):
-    pending_users = await get_pending_users()
-    await message.answer("Админ-панель:", reply_markup=get_admin_panel(pending_users))
-
-@dp.message(F.document | F.photo)
-async def handle_role_document(message: types.Message):
-    user_id = message.from_user.id
-    is_registered, role = await check_user(user_id)
-    if not is_registered:
-        await message.answer("Вы не зарегистрированы или не подтверждены.")
-        return
-
-    file_id = message.photo[-1].file_id if message.photo else message.document.file_id
-    file = await bot.get_file(file_id)
-    downloaded_file = await bot.download_file(file.file_path)
-
-    current_date = datetime.now().strftime("%Y-%m-%d")
-    date_dir = os.path.join(DOCUMENTS_DIR, current_date)
-    if not os.path.exists(date_dir):
-        os.makedirs(date_dir)
-
-    file_extension = ".jpg" if message.photo else os.path.splitext(message.document.file_name)[1]
-    file_name = f"{datetime.now().strftime('%H-%M-%S')}_{user_id}{file_extension}"
-    local_path = os.path.join(date_dir, file_name)
-    with open(local_path, "wb") as f:
-        f.write(await downloaded_file.read())
-
-    role_type = "чек" if role.lower() in ["официант", "бармен", "повар"] else "документ" if role.lower() in ["бухгалтер", "смм"] else "другое"
-    await save_document(user_id, local_path, role_type)
-
-    user = await get_user(user_id)
-    user_name = user[1] if user else "Неизвестный пользователь"
-    await bot.send_message(ADMIN_ID, f"Новый {role_type} от {user_name} ({role.capitalize()}):\nID: {user_id}\nДата: {current_date}\nПуть: {local_path}")
-    await message.answer(f"{role_type.capitalize()} загружен.", reply_markup=get_role_action_keyboard(role.lower()))
-
-@dp.message(F.text.in_(["Отправить чек", "Отправить документ"]))
-async def handle_role_action_message(message: types.Message):
-    user_id = message.from_user.id
-    is_registered, role = await check_user(user_id)
-    if not is_registered:
-        await message.answer("Вы не зарегистрированы или не подтверждены.")
-        return
-    action = message.text.lower()
-    if action == "отправить чек" and role.lower() in ["официант", "бармен", "повар"]:
-        await message.answer("Отправьте чек:")
-    elif action == "отправить документ" and role.lower() in ["бухгалтер", "смм"]:
-        await message.answer("Отправьте документ:")
-    else:
-        await message.answer("Действие недоступно.")
-
-@dp.message(Command("admin_panel"), F.from_user.id == ADMIN_ID)
-async def cmd_admin_panel_command(message: types.Message):
-    pending_users = await get_pending_users()
-    await message.answer("Админ-панель:", reply_markup=get_admin_panel(pending_users))
-
-@dp.callback_query(F.data.startswith("user_info_"))
-async def show_user_info(callback_query: types.CallbackQuery):
-    user_id = int(callback_query.data.split("_")[2])
-    user = await get_user(user_id)
-    if user:
-        await bot.send_message(callback_query.from_user.id, f"ФИО: {user[1]}\nРоль: {user[3]}\nСтатус: {user[4]}")
-    else:
-        await bot.send_message(callback_query.from_user.id, "Пользователь не найден.")
-    await bot.answer_callback_query(callback_query.id)
-
-@dp.callback_query(F.data == "all_users")
-async def process_all_users(callback_query: types.CallbackQuery):
-    async with aiosqlite.connect(DATABASE_FILE) as conn:
-        cursor = await conn.execute('SELECT * FROM users')
-        users = await cursor.fetchall()
-    if not users:
-        await bot.send_message(callback_query.from_user.id, "Список пользователей пуст.")
-    else:
-        response = "Все пользователи:\n" + "\n".join(f"ID: {row[0]}, ФИО: {row[1]}, Роль: {row[3]}, Статус: {row[4]}" for row in users)
-        await bot.send_message(callback_query.from_user.id, response)
-    await bot.answer_callback_query(callback_query.id)
-
-@dp.callback_query(F.data == "documents_by_date")
-async def process_documents_by_date(callback_query: types.CallbackQuery):
-    await bot.send_message(callback_query.from_user.id, "Укажите дату (ГГГГ-ММ-ДД):")
-    await bot.answer_callback_query(callback_query.id)
-
-@dp.message(F.text, F.from_user.id == ADMIN_ID)
-async def process_date_input(message: types.Message):
-    try:
-        if message.text.strip().isdigit():
-            doc_id = int(message.text)
-            doc = await get_document_by_id(doc_id)
-            if doc:
-                if doc[6] == "approved":
-                    local_path = doc[2]
-                    if os.path.exists(local_path):
-                        document = FSInputFile(local_path)
-                        await bot.send_document(message.chat.id, document)
-                    else:
-                        await message.answer("Файл документа не найден локально.")
-                else:
-                    await message.answer("Документ не подтвержден.")
-            else:
-                await message.answer("Документ не найден.")
-            return
-        date = message.text.strip()
-        datetime.strptime(date, "%Y-%m-%d")
-        async with aiosqlite.connect(DATABASE_FILE) as conn:
-            cursor = await conn.execute('SELECT * FROM documents WHERE upload_date = ?', (date,))
-            files = await cursor.fetchall()
-        if not files:
-            await message.answer(f"Документы за {date} не найдены.")
-            return
-        response = f"Документы за {date}:\n"
-        for file in files:
-            user = await get_user(file[1])
-            user_name = user[1] if user else "Неизвестный пользователь"
-            response += f"ID: {file[0]}, Путь: {file[2]}, Сотрудник: {user_name}, Тип: {file[5]}, Статус: {file[6]}\n"
-        await message.answer(response)
+        chat_id = int(message.text)
+        if chat_id < 0 and chat_id not in VK_Groups:
+            VK_Groups.append(chat_id)
+            bot.send_message(message.chat.id, f"Группа {chat_id} добавлена!", reply_markup=main_menu())
+        elif chat_id >= 2000000000 and chat_id not in VK_CONVERSATIONS:
+            VK_CONVERSATIONS.append(chat_id)
+            bot.send_message(message.chat.id, f"Беседа {chat_id} добавлена!", reply_markup=main_menu())
+        else:
+            bot.send_message(message.chat.id, "Чат уже в списке или неверный ID!", reply_markup=main_menu())
     except ValueError:
-        await message.answer("Неверный формат. Используйте ГГГГ-ММ-ДД или ID документа.")
+        bot.send_message(message.chat.id, "ID должен быть числом!", reply_markup=main_menu())
 
-@dp.callback_query(F.data == "documents_by_user")
-async def process_documents_by_user(callback_query: types.CallbackQuery):
-    approved_users = await get_all_approved_users()
-    if not approved_users:
-        await bot.send_message(callback_query.from_user.id, "Нет сотрудников.")
-    else:
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"{row[1]}", callback_data=f"user_docs_{row[0]}")] for row in approved_users])
-        await bot.send_message(callback_query.from_user.id, "Выберите сотрудника:", reply_markup=keyboard)
-    await bot.answer_callback_query(callback_query.id)
+@bot.message_handler(func=lambda message: message.text == "🗑 Удалить чат")
+def remove_chat_prompt(message):
+    markup = create_remove_chat_keyboard()
+    bot.send_message(message.chat.id, "Выберите чат для удаления:", reply_markup=markup)
 
-@dp.callback_query(F.data.startswith("user_docs_"))
-async def process_user_documents(callback_query: types.CallbackQuery):
-    user_id = int(callback_query.data.split("_")[2])
-    user = await get_user(user_id)
-    if not user:
-        await bot.send_message(callback_query.from_user.id, "Сотрудник не найден.")
-        await bot.answer_callback_query(callback_query.id)
-        return
-    user_name = user[1]
-    async with aiosqlite.connect(DATABASE_FILE) as conn:
-        cursor = await conn.execute('SELECT * FROM documents WHERE user_id = ?', (user_id,))
-        files = await cursor.fetchall()
-    if not files:
-        await bot.send_message(callback_query.from_user.id, f"У {user_name} нет документов.")
-    else:
-        response = f"Документы {user_name}:\n" + "\n".join(f"ID: {row[0]}, Путь: {row[2]}, Дата: {row[4]}, Тип: {row[5]}, Статус: {row[6]}" for row in files)
-        await bot.send_message(callback_query.from_user.id, response)
-    await bot.answer_callback_query(callback_query.id)
-
-@dp.callback_query(F.data == "close_menu")
-async def close_menu(callback_query: types.CallbackQuery):
-    await bot.send_message(callback_query.from_user.id, "Меню закрыто.", reply_markup=ReplyKeyboardRemove())
-    await bot.answer_callback_query(callback_query.id)
-
-@dp.callback_query(F.data == "request_documents")
-async def request_documents(callback_query: types.CallbackQuery):
-    approved_users = await get_all_approved_users()
-    if not approved_users:
-        await bot.send_message(callback_query.from_user.id, "Нет сотрудников.")
-    else:
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"{row[1]}", callback_data=f"request_docs_{row[0]}")] for row in approved_users])
-        await bot.send_message(callback_query.from_user.id, "Выберите сотрудника:", reply_markup=keyboard)
-    await bot.answer_callback_query(callback_query.id)
-
-@dp.callback_query(F.data.startswith("request_docs_"))
-async def process_request_documents(callback_query: types.CallbackQuery):
-    user_id = int(callback_query.data.split("_")[2])
-    user = await get_user(user_id)
-    if not user:
-        await bot.send_message(callback_query.from_user.id, "Сотрудник не найден.")
-        await bot.answer_callback_query(callback_query.id)
-        return
-    await bot.send_message(user_id, "Администратор запросил документы.", reply_markup=get_role_action_keyboard(user[3].lower()))
-    await bot.send_message(callback_query.from_user.id, f"Запрос отправлен {user[1]}.")
-    await bot.answer_callback_query(callback_query.id)
-
-@dp.message(Command("approve"))
-async def cmd_approve(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("Доступ только администратору.")
-        return
-    try:
-        user_id = int(message.text.split()[1])
-        await update_user_status(user_id, "approved")
-        user = await get_user(user_id)
-        if user:
-            await bot.send_message(user_id, "Регистрация подтверждена.", reply_markup=get_role_action_keyboard(user[3].lower()))
-            await message.answer(f"{user[1]} ({user[3]}) подтвержден.")
+@bot.callback_query_handler(func=lambda call: call.data.startswith("remove_") or call.data in ["cancel_remove", "no_chats"])
+def handle_remove_chat(call):
+    global VK_Groups, VK_CONVERSATIONS
+    if call.data == "no_chats":
+        bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id,
+                            text="Нет чатов для удаления.", reply_markup=None)
+    elif call.data == "cancel_remove":
+        bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id,
+                            text="Удаление отменено.", reply_markup=None)
+    elif call.data.startswith("remove_group_"):
+        group_id = int(call.data.split("_")[2])
+        if group_id in VK_Groups:
+            VK_Groups = [x for x in VK_Groups if x != group_id]
+            bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id,
+                                text=f"Группа {group_id} удалена.", reply_markup=None)
         else:
-            await message.answer("Пользователь не найден.")
-    except (IndexError, ValueError):
-        await message.answer("Формат: /approve {user_id}")
-
-@dp.message(Command("reject"))
-async def cmd_reject(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("Доступ только администратору.")
-        return
-    try:
-        user_id = int(message.text.split()[1])
-        await update_user_status(user_id, "rejected")
-        user = await get_user(user_id)
-        if user:
-            await bot.send_message(user_id, "Регистрация отклонена.")
-            await message.answer(f"{user[1]} отклонен.")
+            bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id,
+                                text=f"Группа {group_id} не найдена.", reply_markup=None)
+    elif call.data.startswith("remove_conversation_"):
+        conv_id = int(call.data.split("_")[2])
+        if conv_id in VK_CONVERSATIONS:
+            VK_CONVERSATIONS = [x for x in VK_CONVERSATIONS if x != conv_id]
+            bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id,
+                                text=f"Беседа {conv_id} удалена.", reply_markup=None)
         else:
-            await message.answer("Пользователь не найден.")
-    except (IndexError, ValueError):
-        await message.answer("Формат: /reject {user_id}")
+            bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id,
+                                text=f"Беседа {conv_id} не найдена.", reply_markup=None)
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.message.chat.id, "Выбери действие:", reply_markup=main_menu())
 
-@dp.message(Command("get_document"))
-async def cmd_get_document(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("Доступ только администратору.")
-        return
-    try:
-        doc_id = int(message.text.split()[1])
-        doc = await get_document_by_id(doc_id)
-        if doc:
-            if doc[6] == "approved":
-                local_path = doc[2]
-                if os.path.exists(local_path):
-                    document = FSInputFile(local_path)
-                    await bot.send_document(message.chat.id, document)
-                else:
-                    await message.answer("Файл документа не найден локально.")
-            else:
-                await message.answer("Документ не подтвержден.")
-        else:
-            await message.answer("Документ не найден.")
-    except (IndexError, ValueError):
-        await message.answer("Формат: /get_document {id}")
+@bot.message_handler(func=lambda message: message.text == "✍️ Шаблон для спама")
+def edit_template_prompt(message):
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("Изменить шаблон", callback_data="edit_template"))
+    bot.send_message(message.chat.id, f"Текущий шаблон: '{SPAM_TEMPLATE}'", reply_markup=markup)
 
-@dp.message(Command("export_db"), F.from_user.id == ADMIN_ID)
-async def export_database(message: types.Message):
+@bot.callback_query_handler(func=lambda call: call.data == "edit_template")
+def edit_template_callback(call):
+    bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id,
+                         text="Введи новый текст для спама:", reply_markup=None)
+    bot.register_next_step_handler_by_chat_id(call.message.chat.id, update_template)
+
+def update_template(message):
+    global SPAM_TEMPLATE
+    SPAM_TEMPLATE = message.text
+    bot.send_message(message.chat.id, f"Шаблон обновлён: '{SPAM_TEMPLATE}'", reply_markup=main_menu())
+
+@bot.message_handler(func=lambda message: message.text == "🔑 Сменить токен VK")
+def change_vk_token_prompt(message):
+    bot.send_message(message.chat.id, "Введи новый токен VK API:")
+    bot.register_next_step_handler(message, update_vk_token)
+
+def update_vk_token(message):
+    global VK_TOKEN, vk_session, vk
+    VK_TOKEN = message.text.strip()
     try:
-        temp_db_path = os.path.join(DOCUMENTS_DIR, f"database_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db")
-        shutil.copy2(DATABASE_FILE, temp_db_path)
-        db_file = FSInputFile(temp_db_path)
-        await bot.send_document(chat_id=message.chat.id, document=db_file, caption="База данных SQLite")
-        if os.path.exists(temp_db_path):
-            os.remove(temp_db_path)
-        await message.answer("База данных экспортирована.")
+        vk_session = vk_api.VkApi(token=VK_TOKEN)
+        vk = vk_session.get_api()
+        vk.account.getInfo()
+        bot.send_message(message.chat.id, "Токен VK обновлён!", reply_markup=main_menu())
     except Exception as e:
-        logger.error(f"Ошибка экспорта: {e}")
-        await message.answer("Ошибка при экспорте базы данных.")
+        bot.send_message(message.chat.id, f"Ошибка: {str(e)}. Токен недействителен!", reply_markup=main_menu())
 
-@dp.callback_query(F.data == "export_db")
-async def export_database_callback(callback_query: types.CallbackQuery):
-    if callback_query.from_user.id != ADMIN_ID:
-        await bot.send_message(callback_query.from_user.id, "Доступ только администратору.")
-        await bot.answer_callback_query(callback_query.id)
-        return
-    await export_database(types.Message(chat=callback_query.message.chat, from_user=callback_query.from_user, text="/export_db"))
-    await bot.answer_callback_query(callback_query.id)
+@bot.message_handler(func=lambda message: message.text == "🗑 Очистить API VK")
+def clear_vk_api_prompt(message):
+    markup = types.InlineKeyboardMarkup()
+    markup.add(
+        types.InlineKeyboardButton("Да, очистить", callback_data="confirm_clear"),
+        types.InlineKeyboardButton("Отмена", callback_data="cancel_clear")
+    )
+    bot.send_message(message.chat.id, "Очистить API VK и настройки?", reply_markup=markup)
 
-# Запуск
-async def on_startup():
-    await init_db()
-    await bot.set_webhook(f"{WEBHOOK_URL}{WEBHOOK_PATH}")
-    logger.info(f"Webhook установлен: {WEBHOOK_URL}{WEBHOOK_PATH}")
+@bot.callback_query_handler(func=lambda call: call.data in ["confirm_clear", "cancel_clear"])
+def handle_clear_confirmation(call):
+    global VK_TOKEN, vk_session, vk, VK_Groups, VK_CONVERSATIONS, DELAY_TIME, DELETE_TIME, SPAM_TEMPLATE, SPAM_RUNNING, SPAM_THREADS
+    if call.data == "confirm_clear":
+        SPAM_RUNNING['groups'] = SPAM_RUNNING['conversations'] = False
+        for threads in SPAM_THREADS.values():
+            for thread in threads[:]:
+                if thread.is_alive():
+                    thread.join()
+        SPAM_THREADS = {'groups': [], 'conversations': []}
+        VK_TOKEN = ''
+        vk_session = None
+        vk = None
+        VK_Groups = []
+        VK_CONVERSATIONS = []
+        DELAY_TIME = 15
+        DELETE_TIME = 15
+        SPAM_TEMPLATE = "Первое сообщение"
+        bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id,
+                            text="API VK очищен! Нужен новый токен.", reply_markup=None)
+    else:
+        bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id,
+                            text="Очистка отменена.", reply_markup=None)
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.message.chat.id, "Выбери действие:", reply_markup=main_menu())
 
-async def main():
-    app = web.Application()
-    app.router.add_post(WEBHOOK_PATH, handle_webhook)
-    app.router.add_get("/", handle_root)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.getenv("PORT", 8080))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    logger.info(f"Сервер запущен на порту {port}")
-    await on_startup()
-    asyncio.create_task(keep_alive())
-    await asyncio.Event().wait()
+# Поллинг с защитой от конфликтов
+def start_safe_polling():
+    global bot_started
+    bot_started = True
+    retry_count = 0
+    max_retries = 5
+
+    try:
+        bot.remove_webhook()
+        logger.info("Вебхук удалён перед запуском поллинга")
+        bot.stop_polling()
+        time.sleep(2)
+    except Exception as e:
+        logger.error(f"Ошибка при очистке вебхука: {str(e)}")
+
+    while bot_started and retry_count < max_retries:
+        try:
+            logger.info(f"Запуск поллинга для экземпляра {INSTANCE_ID}, попытка {retry_count + 1}")
+            bot.polling(none_stop=True, interval=0, timeout=20)
+            break
+        except apihelper.ApiTelegramException as e:
+            if e.error_code == 409:
+                retry_count += 1
+                logger.error(f"Ошибка 409: конфликт getUpdates (попытка {retry_count}/{max_retries})")
+                bot.stop_polling()
+                time.sleep(5 * retry_count)
+                try:
+                    bot.remove_webhook()
+                    logger.info("Повторная очистка вебхука перед новой попыткой")
+                except Exception as e:
+                    logger.error(f"Ошибка при повторной очистке вебхука: {str(e)}")
+                continue
+            else:
+                logger.error(f"Другая ошибка Telegram API: {str(e)}")
+                break
+        except Exception as e:
+            logger.error(f"Неизвестная ошибка: {str(e)}")
+            break
+
+    if retry_count >= max_retries:
+        logger.error("Превышено количество попыток. Проверьте, не запущен ли бот где-то ещё.")
+        bot_started = False
+
+# Обработка сигналов
+def signal_handler(sig, frame):
+    global bot_started
+    logger.info(f"Завершение экземпляра {INSTANCE_ID}")
+    bot_started = False
+    bot.stop_polling()
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Бот остановлен пользователем")
-    except Exception as e:
-        logger.error(f"Ошибка при запуске: {e}")
+    logger.info(f"Бот запущен, экземпляр: {INSTANCE_ID}")
+    # Запуск антиспячки в отдельном потоке
+    keep_alive_thread = threading.Thread(target=keep_alive, daemon=True)
+    keep_alive_thread.start()
+    start_safe_polling()
