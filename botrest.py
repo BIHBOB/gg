@@ -54,7 +54,6 @@ if not ADMIN_ID:
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://your-bot-name.onrender.com/webhook")
 =======
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://your-app-name.onrender.com")  # Замените на ваше имя приложения
->>>>>>> 53ca98fe8f5c931a905566f5af3093b1614a0b19
 WEBHOOK_PATH = "/webhook"
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
