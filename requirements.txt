@@ -1,6 +1,5 @@
-asyncio
-aiohttp
 aiogram
 python-dotenv
-aiosqlite
+aiohttp
 aiofiles
+aiosqlite
